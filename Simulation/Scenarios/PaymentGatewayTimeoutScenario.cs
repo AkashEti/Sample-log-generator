@@ -5,13 +5,10 @@ namespace SampleLogGenerator.Simulation.Scenarios;
 internal sealed class PaymentGatewayTimeoutScenario : IncidentScenarioBase
 {
     private const string Gateway = "api.paygate-sim.example";
-    private const string TimeoutException =
-        "System.TimeoutException: The operation has timed out after 30000 ms.\n" +
-        "   at PaymentService.Gateway.PayGateClient.AuthorizeAsync(PaymentRequest request, CancellationToken ct)\n" +
-        "   at PaymentService.Payments.PaymentProcessor.ProcessAsync(Order order, CancellationToken ct)";
 
     public override IncidentScenario Scenario => IncidentScenario.PaymentGatewayTimeout;
     public override string Title => "Payment gateway timeouts";
+    public override IncidentDifficulty Difficulty => IncidentDifficulty.Direct;
     public override string RootCauseService => Services.Payment;
     public override string RootCause =>
         $"The external payment gateway ({Gateway}) is responding slowly; PaymentService calls hit the 30 s timeout, retries are exhausted and orders fail with PaymentFailed.";
@@ -21,6 +18,13 @@ internal sealed class PaymentGatewayTimeoutScenario : IncidentScenarioBase
         new(Services.Payment, EventIds.GatewayLatencyHigh, "Gateway p95 latency above threshold"),
         new(Services.Payment, EventIds.GatewayTimeout, "TimeoutException calling the payment gateway"),
         new(Services.Order, EventIds.OrderPaymentFailed, "Orders marked as PaymentFailed"),
+    ];
+    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    [
+        new(Services.Payment, EventIds.GatewayLatencyHigh, "Gateway latency rises"),
+        new(Services.Payment, EventIds.GatewayTimeout, "Gateway calls time out"),
+        new(Services.Payment, EventIds.PaymentFailed, "Retries exhausted, payments fail"),
+        new(Services.Order, EventIds.OrderPaymentFailed, "Orders marked PaymentFailed"),
     ];
     public override IReadOnlyList<string> Remediation =>
     [
@@ -60,10 +64,10 @@ internal sealed class PaymentGatewayTimeoutScenario : IncidentScenarioBase
 
         incident.MarkAffected(o);
         f.Wait(5000).Warning(Services.Payment, EventIds.GatewayResponseDelayed, $"Payment gateway response delayed for order {o.OrderId} (5000 ms elapsed)")
-         .Wait(25000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", TimeoutException, 30000)
+         .Wait(25000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", Exceptions.GatewayTimeout, 30000)
          .Wait(5, 30).Warning(Services.Order, EventIds.PaymentPending, $"Payment for order {o.OrderId} still pending after 30 s")
          .Wait(1000, 2000).Warning(Services.Payment, EventIds.PaymentRetry, $"Retrying payment for order {o.OrderId} (attempt 2/2)")
-         .Wait(30000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", TimeoutException, 30000)
+         .Wait(30000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", Exceptions.GatewayTimeout, 30000)
          .Wait(5, 20).Error(Services.Payment, EventIds.PaymentFailed, $"Payment failed for order {o.OrderId}: gateway retries exhausted")
          .Wait(5, 30).Error(Services.Order, EventIds.OrderPaymentFailed, $"Order {o.OrderId} marked as PaymentFailed");
         CommonFlows.ReleaseInventory(f);

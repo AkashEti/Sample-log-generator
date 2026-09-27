@@ -24,12 +24,25 @@ internal sealed class MetricsAggregator(string environment)
         [Services.Inventory] = (900, 1300),
         [Services.Payment] = (480, 600),
         [Services.Notification] = (200, 260),
+        [Services.Catalog] = (600, 780),
+        [Services.Cart] = (300, 380),
     };
 
     private static readonly Dictionary<string, (string Metric, string Unit, double Min, double Max)[]> ServiceGauges = new()
     {
-        [Services.Order] = [("upstream_payment_latency_p95_ms", "ms", 180, 520)],
-        [Services.Inventory] = [("healthy_instances", "count", 3, 3)],
+        [Services.Order] =
+        [
+            ("upstream_payment_latency_p95_ms", "ms", 180, 520),
+            ("threadpool_queue_length", "count", 0, 4),
+        ],
+        [Services.Auth] = [("cache_hit_ratio_percent", "percent", 97, 99)],
+        [Services.Inventory] =
+        [
+            ("healthy_instances", "count", 3, 3),
+            ("db_lock_wait_ms", "ms", 0, 5),
+            ("threadpool_queue_length", "count", 0, 3),
+        ],
+        [Services.Notification] = [("queue_depth", "count", 0, 25)],
         [Services.Payment] =
         [
             ("db_connections_active", "count", 8, 22),

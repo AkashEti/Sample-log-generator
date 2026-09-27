@@ -22,7 +22,7 @@ public static class GeneratorEndpoints
                 "GET  /logs/stream (Server-Sent Events, same filters)",
                 "GET  /metrics?service=&metric=&from=&to=&take=",
                 "GET  /scenarios",
-                "POST /incidents/{scenario}?durationSeconds=90",
+                "POST /incidents/{scenario}?durationSeconds=90&distractors=2",
                 "POST /incidents/resolve",
                 "GET  /incidents (ground truth)",
                 "POST /datasets",
@@ -46,6 +46,7 @@ public static class GeneratorEndpoints
         {
             s.Scenario,
             s.Title,
+            s.Difficulty,
             s.RootCauseService,
             s.AffectedServices,
             s.IsSecurityTest,
@@ -57,17 +58,19 @@ public static class GeneratorEndpoints
         incidents.MapPost("/resolve", (SimulationHost host) =>
             host.ResolveIncident() is { } record ? Results.Ok(record) : Results.NotFound(new { error = "No active incident." }));
 
-        incidents.MapPost("/{scenario}", (string scenario, int? durationSeconds, SimulationHost host) =>
+        incidents.MapPost("/{scenario}", (string scenario, int? durationSeconds, int? distractors, SimulationHost host) =>
         {
             if (!Enum.TryParse<IncidentScenario>(scenario, ignoreCase: true, out var parsed) || !Enum.IsDefined(parsed))
                 return Results.BadRequest(new { error = $"Unknown scenario '{scenario}'.", valid = Enum.GetNames<IncidentScenario>() });
             if (durationSeconds is < 10 or > 3600)
                 return Results.BadRequest(new { error = "durationSeconds must be between 10 and 3600." });
+            if (distractors is < 0 or > 6)
+                return Results.BadRequest(new { error = "distractors must be between 0 and 6." });
 
             try
             {
                 var duration = durationSeconds is { } s ? TimeSpan.FromSeconds(s) : (TimeSpan?)null;
-                return Results.Ok(host.TriggerIncident(parsed, duration));
+                return Results.Ok(host.TriggerIncident(parsed, duration, distractors));
             }
             catch (InvalidOperationException ex)
             {

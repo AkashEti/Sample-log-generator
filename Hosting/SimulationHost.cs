@@ -10,7 +10,9 @@ public sealed record GeneratorStatus(
     bool IsRunning,
     string Environment,
     int Seed,
-    double OrdersPerSecond,
+    int ActiveUsers,
+    int TargetUsers,
+    string UserRange,
     bool AutoIncidents,
     long LogsWritten,
     long MetricsWritten,
@@ -39,6 +41,8 @@ public sealed class SimulationHost : IDisposable
     public SimulationHost(IOptions<LogGeneratorOptions> options, IHostEnvironment environment, LogBroadcaster broadcaster)
     {
         _options = options.Value;
+        if (_options.MinConcurrentUsers < 1 || _options.MaxConcurrentUsers < _options.MinConcurrentUsers)
+            throw new InvalidOperationException("LogGenerator: MinConcurrentUsers must be >= 1 and <= MaxConcurrentUsers.");
         _broadcaster = broadcaster;
         _generator = new LogGenerator(_options);
 
@@ -79,12 +83,12 @@ public sealed class SimulationHost : IDisposable
     }
 
     /// <exception cref="InvalidOperationException">Another incident is active or the generator is stopped.</exception>
-    public IncidentRecord TriggerIncident(IncidentScenario scenario, TimeSpan? duration)
+    public IncidentRecord TriggerIncident(IncidentScenario scenario, TimeSpan? duration, int? distractors)
     {
         lock (_gate)
         {
             if (!IsRunning) throw new InvalidOperationException("The generator is stopped. POST /generator/start first.");
-            return _generator.StartIncident(scenario, DateTime.UtcNow, duration);
+            return _generator.StartIncident(scenario, DateTime.UtcNow, duration, distractors);
         }
     }
 
@@ -108,7 +112,8 @@ public sealed class SimulationHost : IDisposable
     {
         lock (_gate)
         {
-            return new GeneratorStatus(IsRunning, _options.Environment, _generator.Seed, _options.OrdersPerSecond, _options.AutoIncidents,
+            return new GeneratorStatus(IsRunning, _options.Environment, _generator.Seed, _generator.ActiveUsers, _generator.TargetUsers,
+                $"{_options.MinConcurrentUsers}-{_options.MaxConcurrentUsers}", _options.AutoIncidents,
                 _logsWritten, _metricsWritten, _generator.PendingEvents, _generator.ActiveIncident, LogsPath, MetricsPath, IncidentsPath);
         }
     }

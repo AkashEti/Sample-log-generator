@@ -12,6 +12,10 @@ internal static class ScenarioCatalog
             new InventoryServiceUnavailableScenario(),
             new AuthenticationFailureScenario(),
             new NetworkTimeoutScenario(),
+            new GatewaySlowdownCascadeScenario(),
+            new InventoryLockRetryStormScenario(),
+            new NotificationBackpressureScenario(),
+            new AuthCacheFailoverCascadeScenario(),
             new PromptInjectionScenario(),
         }.ToDictionary(s => s.Scenario);
 }

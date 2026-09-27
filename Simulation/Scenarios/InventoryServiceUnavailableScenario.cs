@@ -5,6 +5,7 @@ namespace SampleLogGenerator.Simulation.Scenarios;
 internal sealed class InventoryServiceUnavailableScenario : IncidentScenarioBase
 {
     private const string CircuitOpenKey = "circuitOpen";
+    private const string FirstCrashKey = "firstCrashTicks";
     private const string OutOfMemory =
         "System.OutOfMemoryException: Exception of type 'System.OutOfMemoryException' was thrown.\n" +
         "   at System.Collections.Generic.Dictionary`2.Resize(Int32 newSize, Boolean forceNewHashCodes)\n" +
@@ -18,6 +19,7 @@ internal sealed class InventoryServiceUnavailableScenario : IncidentScenarioBase
 
     public override IncidentScenario Scenario => IncidentScenario.InventoryServiceUnavailable;
     public override string Title => "InventoryService unavailable";
+    public override IncidentDifficulty Difficulty => IncidentDifficulty.Direct;
     public override string RootCauseService => Services.Inventory;
     public override string RootCause =>
         "InventoryService instances crash with OutOfMemoryException while rebuilding the stock cache and are stuck in a crash loop; " +
@@ -25,10 +27,19 @@ internal sealed class InventoryServiceUnavailableScenario : IncidentScenarioBase
     public override IReadOnlyList<string> AffectedServices => [Services.Inventory, Services.Order];
     public override IReadOnlyList<EvidenceHint> ExpectedEvidence =>
     [
+        new(Services.Inventory, EventIds.MemoryUsageHigh, "Memory near the 4 GB limit on each instance right before it crashes"),
         new(Services.Inventory, EventIds.ProcessCrashed, "OutOfMemoryException in StockCache.RebuildAsync"),
         new(Services.Inventory, EventIds.HealthCheckFailed, "Health checks returning 503"),
         new(Services.Order, EventIds.InventoryCircuitOpened, "Circuit breaker for InventoryService opened"),
         new(Services.Order, EventIds.OrderRejectedInventoryUnavailable, "Orders rejected because inventory is unavailable"),
+    ];
+    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    [
+        new(Services.Inventory, EventIds.MemoryUsageHigh, "Memory reaches the limit during the stock cache rebuild"),
+        new(Services.Inventory, EventIds.ProcessCrashed, "OutOfMemoryException crash loop"),
+        new(Services.Order, EventIds.InventoryCallFailed, "Reservation calls fail with 503"),
+        new(Services.Order, EventIds.OrderRejectedInventoryUnavailable, "Orders rejected"),
+        new(Services.Order, EventIds.InventoryCircuitOpened, "OrderService opens its circuit breaker after repeated failures"),
     ];
     public override IReadOnlyList<string> Remediation =>
     [
@@ -43,30 +54,40 @@ internal sealed class InventoryServiceUnavailableScenario : IncidentScenarioBase
         var restart = 1;
         foreach (var host in Services.HostsFor(Services.Inventory))
         {
-            Crash(g, host, at, restart);
+            var crashedAt = Crash(g, host, at, restart);
+            incident.State.TryAdd(FirstCrashKey, crashedAt.Ticks.ToString());
             at = at.AddMilliseconds(g.Rng.Between(1500, 4000));
         }
     }
 
-    private static void Crash(LogGenerator g, string host, DateTime at, int restartCount)
+    /// <returns>When the process died.</returns>
+    private static DateTime Crash(LogGenerator g, string host, DateTime at, int restartCount)
     {
+        // Memory climbs on the instance just before it dies: host-specific evidence leading up to the crash.
+        // (Never emit before `at`: in live mode earlier timestamps would already have been flushed.)
+        g.Emit(at, Levels.Warning, Services.Inventory, EventIds.MemoryUsageHigh,
+            $"Memory usage {g.Rng.Between(3850, 4050)} MB of 4096 MB limit during stock cache rebuild", host: host);
+        at = at.AddMilliseconds(g.Rng.Between(2000, 6000));
         g.Emit(at, Levels.Critical, Services.Inventory, EventIds.ProcessCrashed, "Unhandled exception. Process terminating.", exception: OutOfMemory, host: host);
         g.Emit(at.AddMilliseconds(g.Rng.Between(500, 1500)), Levels.Warning, Services.Inventory, EventIds.InstanceRestarting,
             $"Instance {host} restarting (restart count {restartCount})", host: host);
+        return at;
     }
 
     public override void OnBackground(LogGenerator g, ActiveIncident incident, DateTime at)
     {
-        if (!incident.State.ContainsKey(CircuitOpenKey))
-        {
-            incident.State[CircuitOpenKey] = "true";
-            g.Emit(at, Levels.Warning, Services.Order, EventIds.InventoryCircuitOpened, "Circuit breaker for InventoryService opened after 5 consecutive failures");
-        }
-
         foreach (var host in Services.HostsFor(Services.Inventory))
         {
             g.Emit(at.AddMilliseconds(g.Rng.Between(0, 3000)), Levels.Error, Services.Inventory, EventIds.HealthCheckFailed,
                 $"Health check failed for {host}: /health returned 503 (stock cache rebuild in progress)", host: host);
+        }
+
+        // The breaker trips after the failures it counts, so it is logged after this round of checks.
+        if (!incident.State.ContainsKey(CircuitOpenKey))
+        {
+            incident.State[CircuitOpenKey] = "true";
+            g.Emit(at.AddMilliseconds(g.Rng.Between(3100, 4000)), Levels.Warning, Services.Order, EventIds.InventoryCircuitOpened,
+                "Circuit breaker for InventoryService opened after 5 consecutive failures");
         }
 
         // Crash loop: one instance dies again on every other check.
@@ -76,7 +97,9 @@ internal sealed class InventoryServiceUnavailableScenario : IncidentScenarioBase
 
     public override void RunOrder(Flow f, ActiveIncident incident)
     {
-        if (!f.Rng.Chance(0.9))
+        // Instances are still up until the first one runs out of memory.
+        var firstCrash = new DateTime(long.Parse(incident.State[FirstCrashKey]), DateTimeKind.Utc);
+        if (f.Cursor < firstCrash || !f.Rng.Chance(0.9))
         {
             CommonFlows.Normal(f);
             return;

@@ -18,8 +18,13 @@ public sealed class LogGeneratorOptions
 
     public string Environment { get; set; } = "Production";
 
-    /// <summary>Average checkout rate. Actual traffic follows a daily curve (+/-30%) and Poisson arrivals.</summary>
-    public double OrdersPerSecond { get; set; } = 2;
+    /// <summary>
+    /// Range for the number of concurrent visitors. A new target within the range is picked every 2-6 minutes;
+    /// each visitor browses, searches, fills a cart and sometimes checks out.
+    /// </summary>
+    public int MinConcurrentUsers { get; set; } = 30;
+
+    public int MaxConcurrentUsers { get; set; } = 100;
 
     /// <summary>How often the live generator flushes due events.</summary>
     public int TickMilliseconds { get; set; } = 250;
@@ -36,6 +41,12 @@ public sealed class LogGeneratorOptions
 
     /// <summary>Scenarios used for automatic injection. Empty means all outage scenarios.</summary>
     public List<IncidentScenario> EnabledScenarios { get; set; } = [];
+
+    /// <summary>
+    /// Unrelated but plausible events (deploys, GC pauses, flag changes...) emitted around each incident.
+    /// 1-2 raise the difficulty to CompetingHypotheses, 3+ to NoisyMisleading.
+    /// </summary>
+    public int DistractorsPerIncident { get; set; }
 
     /// <summary>Also inject <see cref="IncidentScenario.PromptInjectionAttempt"/> automatically.</summary>
     public bool IncludePromptInjection { get; set; }

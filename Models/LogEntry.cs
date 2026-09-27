@@ -15,6 +15,12 @@ public sealed record LogEntry
     public required string Message { get; init; }
     public string? CorrelationId { get; init; }
     public string? RequestId { get; init; }
+
+    /// <summary>The browsing session that made the request (every request of one visitor shares it).</summary>
+    public string? SessionId { get; init; }
+
+    /// <summary>Signed-in customer; absent for guests.</summary>
+    public string? UserId { get; init; }
     public string? OrderId { get; init; }
     public int? DurationMs { get; init; }
     public string? Exception { get; init; }

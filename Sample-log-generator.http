@@ -12,7 +12,10 @@ POST {{host}}/generator/start
 GET {{host}}/scenarios
 
 ### Inject an incident right now (durationSeconds is optional)
-POST {{host}}/incidents/PaymentGatewayTimeout?durationSeconds=90
+POST {{host}}/incidents/AuthenticationFailure?durationSeconds=120&distractors=2
+
+### Inject a cascading failure (watch it spread over ~2 minutes)
+POST {{host}}/incidents/NotificationBackpressure?durationSeconds=120
 
 ### End the active incident early
 POST {{host}}/incidents/resolve
@@ -43,7 +46,9 @@ Content-Type: application/json
   "name": "eval-20",
   "durationMinutes": 120,
   "incidents": 20,
-  "ordersPerSecond": 1,
+  "minUsers": 30,
+  "maxUsers": 60,
   "seed": 42,
-  "includePromptInjection": true
+  "includePromptInjection": true,
+  "distractors": 1
 }

@@ -10,16 +10,19 @@ public sealed record DatasetRequest(
     string? Name = null,
     int DurationMinutes = 60,
     int Incidents = 5,
-    double? OrdersPerSecond = null,
+    int? MinUsers = null,
+    int? MaxUsers = null,
     int? Seed = null,
     List<IncidentScenario>? Scenarios = null,
     bool IncludePromptInjection = false,
-    DateTime? StartTime = null);
+    DateTime? StartTime = null,
+    int? Distractors = null);
 
 public sealed record DatasetResult(
     string Name,
     string Directory,
     int Seed,
+    string Users,
     DateTime StartTime,
     DateTime EndTime,
     int LogCount,
@@ -41,7 +44,13 @@ public static class DatasetGenerator
 
         var options = baseOptions.Clone();
         options.AutoIncidents = false;
-        if (request.OrdersPerSecond is { } rate) options.OrdersPerSecond = rate;
+        if (request.MinUsers is { } minUsers) options.MinConcurrentUsers = minUsers;
+        if (request.MaxUsers is { } maxUsers) options.MaxConcurrentUsers = maxUsers;
+        if (options.MinConcurrentUsers < 1 || options.MaxConcurrentUsers < options.MinConcurrentUsers || options.MaxConcurrentUsers > 5000)
+            throw new ArgumentException("Users must satisfy 1 <= min <= max <= 5000.");
+        if (request.Distractors is { } distractors) options.DistractorsPerIncident = distractors;
+        if (options.DistractorsPerIncident is < 0 or > 6)
+            throw new ArgumentException("Distractors must be between 0 and 6.");
 
         var seed = request.Seed ?? Random.Shared.Next();
         var generator = new LogGenerator(options, seed);
@@ -91,18 +100,19 @@ public static class DatasetGenerator
             Write(generator.Drain(end));
         }
 
-        var result = new DatasetResult(name, directory, seed, start, end, logCount, metricCount, incidents);
+        var result = new DatasetResult(name, directory, seed, $"{options.MinConcurrentUsers}-{options.MaxConcurrentUsers}", start, end, logCount, metricCount, incidents);
         File.WriteAllText(Path.Combine(directory, "manifest.json"), JsonSerializer.Serialize(new
         {
             result.Name,
             result.Seed,
             result.StartTime,
             result.EndTime,
-            options.OrdersPerSecond,
+            result.Users,
             options.Environment,
             result.LogCount,
             result.MetricCount,
-            Incidents = incidents.Select(i => new { i.IncidentId, i.Scenario, i.StartedAt, i.EndedAt }),
+            options.DistractorsPerIncident,
+            Incidents = incidents.Select(i => new { i.IncidentId, i.Scenario, i.Difficulty, i.StartedAt, i.EndedAt }),
         }, new JsonSerializerOptions(JsonDefaults.Options) { WriteIndented = true }));
 
         return result;

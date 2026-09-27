@@ -10,6 +10,17 @@ internal static class RandomExtensions
 
     public static T Pick<T>(this Random rng, IReadOnlyList<T> items) => items[rng.Next(items.Count)];
 
+    public static T Weighted<T>(this Random rng, params (T Item, int Weight)[] choices)
+    {
+        var roll = rng.Next(choices.Sum(c => c.Weight));
+        foreach (var (item, weight) in choices)
+        {
+            if (roll < weight) return item;
+            roll -= weight;
+        }
+        return choices[^1].Item;
+    }
+
     /// <summary>Inter-arrival time of a Poisson process with the given rate.</summary>
     public static TimeSpan Exponential(this Random rng, double ratePerSecond) =>
         TimeSpan.FromSeconds(-Math.Log(1 - rng.NextDouble()) / ratePerSecond);
