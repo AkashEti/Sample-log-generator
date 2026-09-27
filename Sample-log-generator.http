@@ -1,0 +1,49 @@
+@host = http://localhost:5225
+
+### Generator status
+GET {{host}}/status
+
+### Pause / resume live generation
+POST {{host}}/generator/stop
+###
+POST {{host}}/generator/start
+
+### Available incident scenarios
+GET {{host}}/scenarios
+
+### Inject an incident right now (durationSeconds is optional)
+POST {{host}}/incidents/PaymentGatewayTimeout?durationSeconds=90
+
+### End the active incident early
+POST {{host}}/incidents/resolve
+
+### Ground truth for all incidents (do NOT give this to the investigator)
+GET {{host}}/incidents
+
+### Search logs (all filters optional)
+GET {{host}}/logs?service=PaymentService&minLevel=Warning&take=50
+
+### Everything for one order
+GET {{host}}/logs?orderId=ORD-150000
+
+### Free-text search in message / exception
+GET {{host}}/logs?q=timeout&from=2026-09-26T10:00:00Z&to=2026-09-26T11:00:00Z
+
+### Live stream (Server-Sent Events)
+GET {{host}}/logs/stream?minLevel=Error
+
+### Metrics
+GET {{host}}/metrics?service=PaymentService&metric=db_connections_active&take=30
+
+### Generate an offline dataset with ground truth
+POST {{host}}/datasets
+Content-Type: application/json
+
+{
+  "name": "eval-20",
+  "durationMinutes": 120,
+  "incidents": 20,
+  "ordersPerSecond": 1,
+  "seed": 42,
+  "includePromptInjection": true
+}
