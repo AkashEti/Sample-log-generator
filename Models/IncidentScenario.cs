@@ -21,23 +21,63 @@ public enum IncidentScenario
     PromptInjectionAttempt
 }
 
-/// <summary>How hard the incident is to diagnose from the logs.</summary>
+/// <summary>
+/// How hard the incident is to diagnose. Computed per incident from what it contains (the hardest feature wins), so the
+/// same scenario appears at several levels.
+/// </summary>
 public enum IncidentDifficulty
 {
-    /// <summary>A single failing component, visible directly in its own logs.</summary>
-    Direct = 1,
+    /// <summary>Root cause leads straight to the impact; no decoys.</summary>
+    Clean = 1,
 
-    /// <summary>A cause in one component surfaces as failures in others.</summary>
-    Correlated = 2,
+    /// <summary>Benign noise or alarming-but-irrelevant errors (misleading evidence) around the incident.</summary>
+    Distractors = 2,
 
-    /// <summary>A partial failure spread across hosts/services; the pattern must be pieced together.</summary>
-    Distributed = 3,
+    /// <summary>The failure crosses three or more causal hops before users see it.</summary>
+    Cascade = 3,
 
-    /// <summary>Plausible but unrelated events (distractors) compete with the real cause.</summary>
+    /// <summary>A plausible but non-causal explanation (competing change, correlated event) must be ruled out.</summary>
     CompetingHypotheses = 4,
 
-    /// <summary>Heavy distractors or misleading/untrusted log content.</summary>
-    NoisyMisleading = 5
+    /// <summary>Malicious or instruction-like content in the logs on top of the incident.</summary>
+    Adversarial = 5
+}
+
+/// <summary>How a failure travels from its root cause to user impact. A scenario has variants of different shapes.</summary>
+public enum IncidentShape
+{
+    /// <summary>The failing component's own logs show both the cause and the impact.</summary>
+    Direct,
+
+    /// <summary>The cause in one component (or a subset of hosts) surfaces as failures somewhere else.</summary>
+    Correlated,
+
+    /// <summary>Three or more causal hops, typically across services.</summary>
+    Cascade
+}
+
+/// <summary>
+/// Evaluation bucket an incident was planned for (see <c>--mix</c>). It decides the variant shape and the decoys.
+/// </summary>
+public enum EvaluationProfile
+{
+    /// <summary>Direct variant, no decoys.</summary>
+    Clean,
+
+    /// <summary>Correlated variant, no decoys.</summary>
+    Correlated,
+
+    /// <summary>Cascade variant, no decoys.</summary>
+    Cascade,
+
+    /// <summary>Any variant plus benign noise and misleading evidence.</summary>
+    Noisy,
+
+    /// <summary>Any variant plus competing and correlated-but-not-causal decoys.</summary>
+    CompetingHypotheses,
+
+    /// <summary>Any variant plus prompt-injection / hostile content and a competing decoy.</summary>
+    Adversarial
 }
 
 public enum IncidentStatus

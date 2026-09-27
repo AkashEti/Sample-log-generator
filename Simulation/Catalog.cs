@@ -24,6 +24,23 @@ public static class Services
     };
 
     public static IReadOnlyList<string> HostsFor(string service) => Hosts[service];
+
+    public const string Region = "eu-west-1";
+
+    /// <summary>Instances are spread across zones by their ordinal suffix: -1 in a, -2 in b, -3 in c.</summary>
+    public static string ZoneFor(string host) => Region + (char)('a' + (host[^1] - '1'));
+
+    /// <summary>The build each service runs before any deploy happens during the simulation.</summary>
+    public static readonly IReadOnlyDictionary<string, string> InitialVersions = new Dictionary<string, string>
+    {
+        [Order] = "5.3.1",
+        [Auth] = "3.9.0",
+        [Inventory] = "4.1.2",
+        [Payment] = "2.13.2",
+        [Notification] = "3.8.0",
+        [Catalog] = "1.22.4",
+        [Cart] = "1.7.0",
+    };
 }
 
 public static class Levels
@@ -59,6 +76,9 @@ public static class EventIds
     public const int OrderCancelledOutOfStock = 1007;
     public const int AbandonedCartCleanup = 1010;
     public const int FeatureFlagChanged = 1011;
+    public const int ConfigReloaded = 1012;
+    public const int LogShippingBackpressure = 1020;
+    public const int SupportNoteAdded = 1030;
     public const int InventoryCircuitOpened = 1101;
     public const int InventoryCallFailed = 1102;
     public const int OrderRejectedInventoryUnavailable = 1103;
@@ -85,6 +105,8 @@ public static class EventIds
     public const int TokenValidated = 2001;
     public const int JwksRefreshed = 2010;
     public const int ClientRateLimited = 2011;
+    public const int GeoIpRefreshFailed = 2030;
+    public const int CredentialStuffingSuspected = 2040;
     public const int UserSignedIn = 2020;
     public const int SignInFailed = 2021;
     public const int UserSignedOut = 2022;
@@ -106,6 +128,8 @@ public static class EventIds
     public const int ReservationReleased = 3004;
     public const int StockCacheRefreshed = 3010;
     public const int GcPause = 3011;
+    public const int AnalyticsExportStarted = 3020;
+    public const int DiskUsageHigh = 3030;
     public const int MemoryUsageHigh = 3100;
     public const int ProcessCrashed = 3101;
     public const int InstanceRestarting = 3102;
@@ -126,12 +150,15 @@ public static class EventIds
     public const int GatewaySlowResponse = 4005;
     public const int SlowQuery = 4010;
     public const int GatewayCertificateExpiring = 4011;
+    public const int FraudModelUnavailable = 4030;
     public const int GatewayLatencyHigh = 4101;
     public const int GatewayResponseDelayed = 4102;
     public const int GatewayTimeout = 4103;
     public const int PaymentRetry = 4104;
     public const int PaymentFailed = 4105;
     public const int GatewayLatencyRecovered = 4106;
+    public const int GatewayCallRateHigh = 4107;
+    public const int PaymentThreadPoolStarvation = 4108;
     public const int ConnectionPoolUsageHigh = 4201;
     public const int ConnectionPoolExhausted = 4202;
     public const int PaymentPersistFailed = 4203;
@@ -156,9 +183,17 @@ public static class EventIds
     public const int SearchExecuted = 6002;
     public const int ProductViewed = 6003;
     public const int ProductNotFound = 6004;
+    public const int SearchLatencyHigh = 6010;
+    public const int SearchLatencyNormal = 6011;
+    public const int AutoscalerScaled = 6020;
+    public const int CrawlerTrafficSpike = 6021;
+    public const int SearchIndexUnhealthy = 6030;
+    public const int SearchInputRejected = 6040;
+    public const int ReviewSubmitted = 6041;
 
     // CartService 7xxx
     public const int CartItemAdded = 7001;
     public const int CartItemRemoved = 7002;
     public const int CartViewed = 7003;
+    public const int CartCacheTimeout = 7030;
 }

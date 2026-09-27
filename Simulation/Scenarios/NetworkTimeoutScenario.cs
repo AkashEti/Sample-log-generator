@@ -3,12 +3,14 @@ using SampleLogGenerator.Models;
 namespace SampleLogGenerator.Simulation.Scenarios;
 
 /// <summary>
-/// Partial network failure: only the OrderService instances in one zone lose connectivity to PaymentService.
+/// Partial network failure: packet loss in one availability zone. Only the OrderService instance in that zone loses
+/// connectivity to PaymentService.
 /// <code>
-/// order-1 (zone a) ──► PaymentService OK
-/// order-2/3 (zone b) ──► connect timeouts ──► retries ──► orders fail; PaymentService never sees these requests
+/// order-1 (eu-west-1a), order-3 (eu-west-1c) ──► PaymentService OK
+/// order-2 (eu-west-1b) ──► connect timeouts ──► retries ──► orders fail; PaymentService never sees these requests
 /// </code>
-/// Key evidence includes an absence: no PaymentService log lines exist for the failed orders.
+/// That is the classic form; each availability zone is a variant.
+/// Key evidence includes absences: no PaymentService logs for the failed orders, and no timeouts outside the zone.
 /// </summary>
 internal sealed class NetworkTimeoutScenario : IncidentScenarioBase
 {
@@ -19,45 +21,75 @@ internal sealed class NetworkTimeoutScenario : IncidentScenarioBase
         "   at OrderService.Clients.PaymentClient.ChargeAsync(ChargeRequest request, CancellationToken ct)";
 
     private static IReadOnlyList<string> OrderHosts => Services.HostsFor(Services.Order);
-    private static string HealthyHost => OrderHosts[0];
-    private static IReadOnlyList<string> IsolatedHosts => [.. OrderHosts.Skip(1)];
+    private static IReadOnlyList<string> Zones => [.. OrderHosts.Select(Services.ZoneFor).Distinct()];
 
     public override IncidentScenario Scenario => IncidentScenario.NetworkTimeout;
-    public override string Title => "Network timeouts between OrderService and PaymentService";
-    public override IncidentDifficulty Difficulty => IncidentDifficulty.Distributed;
+    public override string Title => "Zonal packet loss between OrderService and PaymentService";
     public override string RootCauseService => Services.Order;
-    public override string RootCause =>
-        $"Network connectivity problem (packet loss) between the OrderService instances {IsolatedHosts[0]} and {IsolatedHosts[1]} and PaymentService ({Endpoint}); " +
-        $"their calls time out before reaching PaymentService, which logs nothing for the failed orders. {HealthyHost} is unaffected.";
     public override IReadOnlyList<string> AffectedServices => [Services.Order, Services.Payment, Services.Inventory];
-    public override IReadOnlyList<EvidenceHint> ExpectedEvidence =>
-    [
-        new(Services.Order, EventIds.PaymentUpstreamDegraded, "Elevated connect time / packet loss to PaymentService, reported only by some OrderService hosts"),
-        new(Services.Order, EventIds.PaymentCallTimeout, "SocketException: Connection timed out calling PaymentService, only from the same hosts"),
-        new(Services.Payment, 0, "No PaymentService logs exist for the affected orders (the requests never arrived)"),
-    ];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
-    [
-        new(Services.Order, EventIds.PaymentUpstreamDegraded, "Packet loss from two OrderService hosts to PaymentService"),
-        new(Services.Order, EventIds.PaymentCallTimeout, "Connect timeouts calling PaymentService"),
-        new(Services.Order, EventIds.OrderFailedPaymentUnreachable, "Orders fail: PaymentService unreachable"),
-    ];
-    public override IReadOnlyList<string> Remediation =>
-    [
-        "Check network path, security groups and routing from the affected OrderService hosts to PaymentService",
-        "Drain or reschedule the affected OrderService instances",
-        "Add connect-timeout alerts per upstream dependency and per instance",
-    ];
 
-    public override void OnStart(LogGenerator g, ActiveIncident incident, DateTime at) => ReportDegraded(g, at);
+    // The defaults describe the classic form (eu-west-1b); every zone is a variant.
+    private static readonly ScenarioVariant Classic = ZoneVariant(Services.Region + "b");
+    public override string RootCause => Classic.RootCause!;
+    public override IReadOnlyList<EvidenceHint> ExpectedEvidence => Classic.ExpectedEvidence!;
+    public override IReadOnlyList<CausalLink> CausalChain => Classic.CausalChain!;
+    public override IReadOnlyList<AbsenceCondition> ExpectedAbsences => Classic.ExpectedAbsences!;
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence => Classic.RecoveryEvidence!;
+    public override IReadOnlyList<string> Remediation => Classic.Remediation!;
 
-    public override void OnBackground(LogGenerator g, ActiveIncident incident, DateTime at) => ReportDegraded(g, at);
+    public override IReadOnlyList<ScenarioVariant> Variants => [Classic, .. Zones.Where(z => z != Services.Region + "b").Select(ZoneVariant)];
 
-    private static void ReportDegraded(LogGenerator g, DateTime at)
+    private static ScenarioVariant ZoneVariant(string zone)
     {
-        foreach (var host in IsolatedHosts)
+        IReadOnlyList<string> isolated = [.. OrderHosts.Where(h => Services.ZoneFor(h) == zone)];
+        IReadOnlyList<string> healthy = [.. OrderHosts.Where(h => Services.ZoneFor(h) != zone)];
+        return new ScenarioVariant($"zone:{zone}", IncidentShape.Direct)
         {
-            g.Emit(at.AddMilliseconds(g.Rng.Between(0, 2000)), Levels.Warning, Services.Order, EventIds.PaymentUpstreamDegraded,
+            Hosts = isolated,
+            RootCause =
+                $"Packet loss in availability zone {zone} on the path to PaymentService ({Endpoint}): the OrderService instance in that zone " +
+                $"({string.Join(", ", isolated)}) times out connecting, so its requests never reach PaymentService, which logs nothing for them. " +
+                $"Instances in other zones ({string.Join(", ", healthy)}) are unaffected.",
+            ExpectedEvidence =
+            [
+                new(Services.Order, EventIds.PaymentUpstreamDegraded, $"Connect time / packet loss to PaymentService, reported only from {zone}", isolated),
+                new(Services.Order, EventIds.PaymentCallTimeout, $"SocketException: Connection timed out calling PaymentService, only from {zone}", isolated),
+            ],
+            CausalChain =
+            [
+                new(Services.Order, EventIds.PaymentUpstreamDegraded, $"Packet loss from {zone} to PaymentService"),
+                new(Services.Order, EventIds.PaymentCallTimeout, "Connect timeouts calling PaymentService"),
+                new(Services.Order, EventIds.OrderFailedPaymentUnreachable, "Orders fail: PaymentService unreachable"),
+            ],
+            ExpectedAbsences =
+            [
+                new(AbsenceKind.NoLogsForAffectedRequests, Services.Payment, "The failed requests never reached PaymentService, so it has no logs for them"),
+                new(AbsenceKind.NoEventOnHosts, Services.Order, $"No connect timeouts from OrderService outside {zone}", EventIds.PaymentCallTimeout, healthy),
+            ],
+            RecoveryEvidence =
+            [
+                new(Services.Order, EventIds.PaymentConnectivityRestored, "Connectivity restored", isolated),
+            ],
+            Remediation =
+            [
+                $"Shift traffic away from {zone} / drain the OrderService instances there",
+                "Check the network path, security groups and routing from that zone to PaymentService; escalate to the cloud provider",
+                "Add connect-timeout alerts per upstream dependency and per zone",
+            ],
+        };
+    }
+
+    private static IReadOnlyList<string> IsolatedHosts(ActiveIncident incident) => incident.Variant.Hosts;
+
+    public override void OnStart(LogGenerator g, ActiveIncident incident, DateTime at) => ReportDegraded(g, incident, at);
+
+    public override void OnBackground(LogGenerator g, ActiveIncident incident, DateTime at) => ReportDegraded(g, incident, at);
+
+    private static void ReportDegraded(LogGenerator g, ActiveIncident incident, DateTime at)
+    {
+        foreach (var host in IsolatedHosts(incident))
+        {
+            g.Emit(at, Levels.Warning, Services.Order, EventIds.PaymentUpstreamDegraded,
                 $"Upstream {Endpoint} degraded: TCP connect time {g.Rng.Between(2500, 9000)} ms, packet loss {g.Rng.Between(35, 70)}%", host: host);
         }
     }
@@ -67,7 +99,7 @@ internal sealed class NetworkTimeoutScenario : IncidentScenarioBase
         var o = f.Order;
         var host = f.Rng.Pick(OrderHosts);
         o.PinHost(Services.Order, host);
-        if (host == HealthyHost || !f.Rng.Chance(0.9))
+        if (!IsolatedHosts(incident).Contains(host) || !f.Rng.Chance(0.95))
         {
             CommonFlows.Normal(f);
             return;
@@ -78,16 +110,22 @@ internal sealed class NetworkTimeoutScenario : IncidentScenarioBase
         if (!CommonFlows.ReserveInventory(f)) return;
         incident.MarkAffected(o);
 
-        f.Wait(10000).Error(Services.Order, EventIds.PaymentCallTimeout, $"HTTP request to PaymentService timed out for order {o.OrderId}", TimeoutException, 10000)
-         .Wait(500, 1500).Warning(Services.Order, EventIds.PaymentCallRetry, $"Retrying PaymentService call for order {o.OrderId} (attempt 2/2)")
-         .Wait(10000).Error(Services.Order, EventIds.PaymentCallTimeout, $"HTTP request to PaymentService timed out for order {o.OrderId}", TimeoutException, 10000)
-         .Wait(5, 20).Error(Services.Order, EventIds.OrderFailedPaymentUnreachable, $"Order {o.OrderId} failed: PaymentService unreachable");
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var attemptStart = f.Cursor;
+            f.Wait(10000).Error(Services.Order, EventIds.PaymentCallTimeout, $"HTTP request to PaymentService timed out for order {o.OrderId}",
+                TimeoutException, 10000, f.TimedOut("PaymentClient.Charge", attemptStart, attempt));
+            if (attempt == 1)
+                f.Wait(500, 1500).Warning(Services.Order, EventIds.PaymentCallRetry, $"Retrying PaymentService call for order {o.OrderId} (attempt 2/2)");
+        }
+
+        f.Wait(5, 20).Error(Services.Order, EventIds.OrderFailedPaymentUnreachable, $"Order {o.OrderId} failed: PaymentService unreachable");
         CommonFlows.ReleaseInventory(f);
     }
 
     public override void OnEnd(LogGenerator g, ActiveIncident incident, DateTime at)
     {
-        foreach (var host in IsolatedHosts)
+        foreach (var host in IsolatedHosts(incident))
         {
             g.Emit(at, Levels.Information, Services.Order, EventIds.PaymentConnectivityRestored,
                 $"Connectivity to {Endpoint} restored: TCP connect time {g.Rng.Between(1, 4)} ms", host: host);

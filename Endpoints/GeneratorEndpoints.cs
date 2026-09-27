@@ -3,6 +3,7 @@ using SampleLogGenerator.Configuration;
 using SampleLogGenerator.Hosting;
 using SampleLogGenerator.Models;
 using SampleLogGenerator.Output;
+using SampleLogGenerator.Simulation;
 using SampleLogGenerator.Simulation.Scenarios;
 
 namespace SampleLogGenerator.Endpoints;
@@ -46,7 +47,7 @@ public static class GeneratorEndpoints
         {
             s.Scenario,
             s.Title,
-            s.Difficulty,
+            Variants = s.Variants.Select(v => new { v.Name, v.Shape }),
             s.RootCauseService,
             s.AffectedServices,
             s.IsSecurityTest,
@@ -58,7 +59,7 @@ public static class GeneratorEndpoints
         incidents.MapPost("/resolve", (SimulationHost host) =>
             host.ResolveIncident() is { } record ? Results.Ok(record) : Results.NotFound(new { error = "No active incident." }));
 
-        incidents.MapPost("/{scenario}", (string scenario, int? durationSeconds, int? distractors, SimulationHost host) =>
+        incidents.MapPost("/{scenario}", (string scenario, int? durationSeconds, int? distractors, string? variant, string? profile, SimulationHost host) =>
         {
             if (!Enum.TryParse<IncidentScenario>(scenario, ignoreCase: true, out var parsed) || !Enum.IsDefined(parsed))
                 return Results.BadRequest(new { error = $"Unknown scenario '{scenario}'.", valid = Enum.GetNames<IncidentScenario>() });
@@ -66,15 +67,32 @@ public static class GeneratorEndpoints
                 return Results.BadRequest(new { error = "durationSeconds must be between 10 and 3600." });
             if (distractors is < 0 or > 6)
                 return Results.BadRequest(new { error = "distractors must be between 0 and 6." });
+            EvaluationProfile? parsedProfile = null;
+            if (profile is not null)
+            {
+                if (!Enum.TryParse<EvaluationProfile>(profile, ignoreCase: true, out var p) || !Enum.IsDefined(p))
+                    return Results.BadRequest(new { error = $"Unknown profile '{profile}'.", valid = Enum.GetNames<EvaluationProfile>() });
+                parsedProfile = p;
+            }
 
             try
             {
-                var duration = durationSeconds is { } s ? TimeSpan.FromSeconds(s) : (TimeSpan?)null;
-                return Results.Ok(host.TriggerIncident(parsed, duration, distractors));
+                var plan = (parsedProfile is { } pp ? EvaluationMix.PlanFor(pp) : new IncidentPlan()) with
+                {
+                    Duration = durationSeconds is { } s ? TimeSpan.FromSeconds(s) : null,
+                    Variant = variant,
+                };
+                if (variant is not null) plan = plan with { Shape = null };
+                if (distractors is not null) plan = plan with { Distractors = distractors };
+                return Results.Ok(host.TriggerIncident(parsed, plan));
             }
             catch (InvalidOperationException ex)
             {
                 return Results.Conflict(new { error = ex.Message });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
         });
 

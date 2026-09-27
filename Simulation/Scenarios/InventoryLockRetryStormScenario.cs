@@ -34,12 +34,17 @@ internal sealed class InventoryLockRetryStormScenario : CascadeScenarioBase
         "multiplying the load until InventoryService's thread pool starves, health checks time out, instances are pulled and orders are rejected.";
     public override IReadOnlyList<string> AffectedServices => [Services.Inventory, Services.Order];
     protected override IReadOnlyList<double> StageStarts => [0, 0.15, 0.35, 0.6];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    protected override int ContainedAt => 1;
+    protected override string ContainedRootCause =>
+        $"InventoryService's stock recount job for warehouse {Warehouse} holds locks on the stock_levels table. Reservations block on the lock " +
+        $"past OrderService's {OrderTimeoutMs / 1000} s timeout; OrderService retries up to {MaxAttempts} times and rejects the order when every attempt " +
+        "times out. The job finished before the retries grew into a load surge, so InventoryService itself stayed healthy.";
+    public override IReadOnlyList<CausalLink> CausalChain =>
     [
         new(Services.Inventory, EventIds.StockRecountStarted, $"Stock recount job for {Warehouse} starts right before the slowdown"),
         new(Services.Inventory, EventIds.LockWait, "Reservation queries wait on locks held by the recount job's UPDATE"),
-        new(Services.Order, EventIds.InventoryCallTimeout, "OrderService's calls to InventoryService time out after 5 s"),
-        new(Services.Order, EventIds.InventoryCallRetry, "OrderService retries every timed-out call"),
+        new(Services.Order, EventIds.InventoryCallTimeout, "OrderService's calls to InventoryService time out after 5 s", Concurrent: true),
+        new(Services.Order, EventIds.InventoryCallRetry, "OrderService retries every timed-out call", Concurrent: true),
         new(Services.Inventory, EventIds.RequestSurge, "Inbound request rate several times normal (retries), not real traffic growth"),
         new(Services.Inventory, EventIds.ThreadPoolStarvation, "Thread pool starvation on InventoryService"),
         new(Services.Inventory, EventIds.HealthCheckTimeout, "Health checks time out, so instances are pulled"),
@@ -49,10 +54,16 @@ internal sealed class InventoryLockRetryStormScenario : CascadeScenarioBase
     // expected evidence rather than a link in the ordered chain.
     public override IReadOnlyList<EvidenceHint> ExpectedEvidence =>
     [
-        .. CausalChain,
+        .. CausalChain.Select(l => l.ToHint()),
         new(Services.Order, EventIds.OrderRejectedInventoryUnavailable, "Orders rejected once all retries time out"),
     ];
 
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence =>
+    [
+        new(Services.Inventory, EventIds.StockRecountCompleted, "Recount job completes"),
+        new(Services.Inventory, EventIds.InstanceRecovered, "Instances back in the load balancer"),
+        new(Services.Order, EventIds.InventoryCircuitClosed, "Circuit breaker closed"),
+    ];
     public override IReadOnlyList<string> Remediation =>
     [
         "Stop the stock recount job, then reschedule it off-peak with small batches and short transactions",
@@ -148,10 +159,13 @@ internal sealed class InventoryLockRetryStormScenario : CascadeScenarioBase
             }
 
             incident.MarkAffected(o);
-            f.Wait(latency).Info(Services.Inventory, EventIds.StockReserved, $"Reserved {o.ItemCount} items for order {o.OrderId}", latency);
+            var callerTimeoutAt = attemptStart.AddMilliseconds(OrderTimeoutMs);
+            f.Wait(latency).Info(Services.Inventory, EventIds.StockReserved, $"Reserved {o.ItemCount} items for order {o.OrderId}", latency,
+                Flow.Late("InventoryClient.Reserve", attemptStart, callerTimeoutAt, success: true, attempt));
             f.At(attemptStart).Wait(OrderTimeoutMs)
              .Error(Services.Order, EventIds.InventoryCallTimeout, $"HTTP request to InventoryService timed out for order {o.OrderId} (attempt {attempt}/{MaxAttempts})",
-                Exceptions.HttpClientTimeout("InventoryClient", "ReserveAsync", OrderTimeoutMs / 1000), OrderTimeoutMs);
+                Exceptions.HttpClientTimeout("InventoryClient", "ReserveAsync", OrderTimeoutMs / 1000), OrderTimeoutMs,
+                f.TimedOut("InventoryClient.Reserve", attemptStart, attempt));
             if (attempt < MaxAttempts)
                 f.Wait(0, 50).Warning(Services.Order, EventIds.InventoryCallRetry, $"Retrying InventoryService call for order {o.OrderId} (attempt {attempt + 1}/{MaxAttempts})");
         }

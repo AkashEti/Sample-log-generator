@@ -27,15 +27,24 @@ internal sealed class AuthCacheFailoverCascadeScenario : CascadeScenarioBase
         "concurrency limit and shed requests with 429, rejecting checkouts.";
     public override IReadOnlyList<string> AffectedServices => [Services.Auth, Services.Order];
     protected override IReadOnlyList<double> StageStarts => [0, 0.15, 0.35, 0.6];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    protected override int ContainedAt => 2;
+    protected override string ContainedRootCause =>
+        $"A Redis failover of AuthService's token-revocation cache ({Cache}) left it with a cold cache, so revocation checks fell back to auth-db " +
+        $"and token validation slowed past OrderService's {OrderTimeoutMs / 1000} s timeout. Checkouts whose retries all timed out failed. " +
+        "The cache warmed up before AuthService reached its concurrency limit, so there was no load shedding.";
+    public override IReadOnlyList<CausalLink> CausalChain =>
     [
         new(Services.Auth, EventIds.CacheConnectionLost, $"Connection to {Cache} lost; failover to a new primary"),
         new(Services.Auth, EventIds.RevocationCacheMisses, "Revocation cache hit ratio collapses; lookups served from auth-db"),
         new(Services.Auth, EventIds.TokenValidationSlow, "Token validation latency climbs"),
-        new(Services.Order, EventIds.AuthCallTimeout, "OrderService's calls to AuthService time out after 3 s"),
-        new(Services.Order, EventIds.AuthCallRetry, "OrderService retries every timed-out validation"),
+        new(Services.Order, EventIds.AuthCallTimeout, "OrderService's calls to AuthService time out after 3 s", Concurrent: true),
+        new(Services.Order, EventIds.AuthCallRetry, "OrderService retries every timed-out validation", Concurrent: true),
         new(Services.Auth, EventIds.LoadShedding, "AuthService hits its concurrency limit and sheds load (429)"),
         new(Services.Order, EventIds.CheckoutThrottled, "Checkouts rejected with 429"),
+    ];
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence =>
+    [
+        new(Services.Auth, EventIds.RevocationCacheWarm, "Revocation cache warm again"),
     ];
     public override IReadOnlyList<string> Remediation =>
     [
@@ -126,10 +135,13 @@ internal sealed class AuthCacheFailoverCascadeScenario : CascadeScenarioBase
 
             // AuthService still finishes the validation after OrderService stopped waiting.
             incident.MarkAffected(o);
-            f.Wait(ms).Info(Services.Auth, EventIds.TokenValidated, $"Access token validated for customer {o.CustomerId}", ms);
+            var callerTimeoutAt = attemptStart.AddMilliseconds(OrderTimeoutMs);
+            f.Wait(ms).Info(Services.Auth, EventIds.TokenValidated, $"Access token validated for customer {o.CustomerId}", ms,
+                Flow.Late("AuthClient.ValidateToken", attemptStart, callerTimeoutAt, success: true, attempt));
             f.At(attemptStart).Wait(OrderTimeoutMs)
              .Error(Services.Order, EventIds.AuthCallTimeout, $"Timed out waiting for AuthService to validate token for customer {o.CustomerId} (attempt {attempt}/{MaxAttempts})",
-                Exceptions.HttpClientTimeout("AuthClient", "ValidateTokenAsync", OrderTimeoutMs / 1000), OrderTimeoutMs);
+                Exceptions.HttpClientTimeout("AuthClient", "ValidateTokenAsync", OrderTimeoutMs / 1000), OrderTimeoutMs,
+                f.TimedOut("AuthClient.ValidateToken", attemptStart, attempt));
             if (attempt < MaxAttempts)
                 f.Wait(0, 50).Warning(Services.Order, EventIds.AuthCallRetry, $"Retrying AuthService token validation for customer {o.CustomerId} (attempt {attempt + 1}/{MaxAttempts})");
         }

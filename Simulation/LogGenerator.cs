@@ -4,6 +4,28 @@ using SampleLogGenerator.Simulation.Scenarios;
 
 namespace SampleLogGenerator.Simulation;
 
+/// <summary>How to run one incident. Unset fields are chosen at random or taken from the options.</summary>
+public sealed record IncidentPlan
+{
+    public TimeSpan? Duration { get; init; }
+
+    /// <summary>A variant name (see GET /scenarios); otherwise a random variant, of <see cref="Shape"/> when set.</summary>
+    public string? Variant { get; init; }
+    public IncidentShape? Shape { get; init; }
+
+    /// <summary>Decoys to emit; defaults to <see cref="LogGeneratorOptions.DistractorsPerIncident"/>.</summary>
+    public int? Distractors { get; init; }
+
+    /// <summary>Decoy kinds to rotate through; defaults to <see cref="LogGeneratorOptions.DistractorKinds"/>.</summary>
+    public IReadOnlyList<DistractorKind>? DistractorKinds { get; init; }
+
+    /// <summary>Recorded in the ground truth when the incident was planned from an evaluation mix.</summary>
+    public EvaluationProfile? Profile { get; init; }
+
+    /// <summary>Hostile, instruction-like text in the logs on top of the outage; marks the incident as a security test.</summary>
+    public bool Adversarial { get; init; }
+}
+
 /// <summary>Everything the generator produced during one <see cref="LogGenerator.Advance"/> call.</summary>
 public sealed class GeneratorBatch
 {
@@ -28,6 +50,7 @@ public sealed class LogGenerator
     private readonly List<IncidentRecord> _completed = [];
     private readonly MetricsAggregator _metrics;
     private readonly UserTraffic _traffic;
+    private readonly Dictionary<string, List<(DateTime From, string Version)>> _hostVersions = [];
     private long _sequence;
     private long _nextOrderNumber;
     private bool _started;
@@ -98,11 +121,11 @@ public sealed class LogGenerator
         var interval = TimeSpan.FromSeconds(Math.Max(1, _options.MetricsIntervalSeconds));
         while (_nextMetricsAt <= now)
         {
-            batch.Metrics.AddRange(_metrics.Snapshot(_nextMetricsAt, _active, Rng));
+            batch.Metrics.AddRange(_metrics.Snapshot(_nextMetricsAt, (int)interval.TotalSeconds, _active, Rng));
             batch.Metrics.Add(new MetricSample
             {
                 Timestamp = _nextMetricsAt, Service = "Platform", Metric = "active_users", Value = _traffic.ActiveUsers, Unit = "count",
-                Environment = _options.Environment,
+                Type = MetricTypes.Gauge, Environment = _options.Environment,
             });
             _nextMetricsAt += interval;
         }
@@ -115,67 +138,133 @@ public sealed class LogGenerator
 
     /// <summary>Starts an incident now. Only one incident is active at a time.</summary>
     /// <param name="distractors">Unrelated decoy events to emit; defaults to <see cref="LogGeneratorOptions.DistractorsPerIncident"/>.</param>
-    public IncidentRecord StartIncident(IncidentScenario scenario, DateTime at, TimeSpan? duration = null, int? distractors = null)
+    public IncidentRecord StartIncident(IncidentScenario scenario, DateTime at, TimeSpan? duration = null, int? distractors = null) =>
+        StartIncident(scenario, at, new IncidentPlan { Duration = duration, Distractors = distractors });
+
+    public IncidentRecord StartIncident(IncidentScenario scenario, DateTime at, IncidentPlan plan)
     {
         if (_active is not null)
             throw new InvalidOperationException($"Incident {_active.Record.IncidentId} ({_active.Record.Scenario}) is still active.");
         if (!_started) Initialize(at);
 
         var definition = _scenarios[scenario];
-        var incidentDuration = duration ?? RandomDuration();
-        var decoys = PickDistractors(definition, distractors ?? _options.DistractorsPerIncident);
+        var variant = PickVariant(definition, plan);
+        var incidentDuration = plan.Duration ?? RandomDuration();
         var record = new IncidentRecord
         {
             IncidentId = $"INC-{at:yyyyMMdd-HHmmss}-{Rng.Hex(4).ToUpperInvariant()}",
             Scenario = scenario,
             Title = definition.Title,
-            Difficulty = DifficultyFor(definition.Difficulty, decoys.Count),
+            Variant = variant.Name,
+            Shape = variant.Shape,
+            Profile = plan.Profile,
             StartedAt = TruncateToMilliseconds(at),
             RootCauseService = definition.RootCauseService,
-            RootCause = definition.RootCause,
-            AffectedServices = definition.AffectedServices,
-            ExpectedEvidence = definition.ExpectedEvidence,
-            CausalChain = definition.CausalChain,
-            Remediation = definition.Remediation,
-            IsSecurityTest = definition.IsSecurityTest,
-            Distractors = [.. decoys.Select(d => d.ToHint())],
+            RootCause = variant.RootCause ?? definition.RootCause,
+            AffectedServices = variant.AffectedServices ?? definition.AffectedServices,
+            ExpectedEvidence = variant.ExpectedEvidence ?? definition.ExpectedEvidence,
+            CausalChain = variant.CausalChain ?? definition.CausalChain,
+            ExpectedAbsences = variant.ExpectedAbsences ?? definition.ExpectedAbsences,
+            RecoveryEvidence = variant.RecoveryEvidence ?? definition.RecoveryEvidence,
+            Remediation = variant.Remediation ?? definition.Remediation,
+            IsSecurityTest = definition.IsSecurityTest || plan.Adversarial,
         };
+
+        var decoys = PickDistractors(record, plan.Distractors ?? _options.DistractorsPerIncident,
+            plan.DistractorKinds is { Count: > 0 } kinds ? [.. kinds.Distinct()] : EnabledDistractorKinds());
+        var decoyTimes = decoys.Select(d => at.AddSeconds(DecoyOffsetSeconds(d.Kind, incidentDuration))).ToList();
+        record.Distractors.AddRange(decoys.Zip(decoyTimes, (d, t) => d.ToRecord(t)));
+        record.Difficulty = Scenarios.ActiveIncident.DifficultyOf(record); // provisional; final once the observed chain is known
 
         _active = new ActiveIncident
         {
             Record = record,
             Scenario = definition,
+            Variant = variant,
             StartedAt = at,
             EndsAt = at + incidentDuration,
             NextBackgroundAt = at + definition.BackgroundInterval,
         };
         definition.OnStart(this, _active, at);
 
-        // Decoys land in the early part of the incident, when an investigator is forming hypotheses.
-        var window = Math.Max(1, Math.Min(90, incidentDuration.TotalSeconds * 0.4));
-        foreach (var decoy in decoys)
-            decoy.Emit(this, at.AddSeconds(Rng.Between(0.0, window)));
+        foreach (var (decoy, decoyAt) in decoys.Zip(decoyTimes))
+            EmitDecoy(decoy, decoyAt);
 
         return record;
     }
 
-    /// <summary>Random decoys, never one that shares an event id with the real evidence.</summary>
-    private List<Distractor> PickDistractors(IncidentScenarioBase definition, int count)
+    private ScenarioVariant PickVariant(IncidentScenarioBase definition, IncidentPlan plan)
     {
-        if (count <= 0) return [];
-        var evidenceIds = definition.ExpectedEvidence.Concat(definition.CausalChain).Select(e => e.EventId).ToHashSet();
-        return [.. Distractor.All.Where(d => !evidenceIds.Contains(d.EventId)).OrderBy(_ => Rng.Next()).Take(count)];
+        if (plan.Variant is { } name)
+            return definition.Variants.FirstOrDefault(v => string.Equals(v.Name, name, StringComparison.OrdinalIgnoreCase))
+                   ?? throw new ArgumentException($"{definition.Scenario} has no variant '{name}'. Variants: {string.Join(", ", definition.Variants.Select(v => v.Name))}");
+        var candidates = plan.Shape is { } shape ? definition.Variants.Where(v => v.Shape == shape).ToList() : [.. definition.Variants];
+        if (candidates.Count == 0)
+            throw new ArgumentException($"{definition.Scenario} has no {plan.Shape} variant.");
+        return Rng.Pick(candidates);
     }
 
-    private static IncidentDifficulty DifficultyFor(IncidentDifficulty inherent, int distractorCount)
+    /// <summary>
+    /// Decoys drawn in rotation from the given kinds. A decoy never shares a (service, event id) pair with the
+    /// incident's evidence, chain or recovery events, so it cannot turn into accidental causal evidence.
+    /// </summary>
+    private List<Distractor> PickDistractors(IncidentRecord record, int count, List<DistractorKind> kinds)
     {
-        var withDistractors = distractorCount switch
+        if (count <= 0 || kinds.Count == 0) return [];
+        var reserved = record.ExpectedEvidence.Select(e => (e.Service, e.EventId))
+            .Concat(record.CausalChain.Select(l => (l.Service, l.EventId)))
+            .Concat(record.RecoveryEvidence.Select(e => (e.Service, e.EventId)))
+            .ToHashSet();
+        var offset = Rng.Next(kinds.Count); // rotate from a random kind, so every kind gets used
+        var picked = new List<Distractor>();
+        for (var i = 0; i < count; i++)
         {
-            0 => inherent,
-            < 3 => IncidentDifficulty.CompetingHypotheses,
-            _ => IncidentDifficulty.NoisyMisleading,
+            var kind = kinds[(offset + i) % kinds.Count];
+            var candidates = Distractor.All
+                .Where(d => d.Kind == kind && !reserved.Contains((d.Service, d.EventId)) && !picked.Contains(d))
+                .ToList();
+            if (candidates.Count > 0) picked.Add(Rng.Pick(candidates));
+        }
+        return picked;
+    }
+
+    private List<DistractorKind> EnabledDistractorKinds() =>
+        _options.DistractorKinds.Count > 0 ? [.. _options.DistractorKinds.Distinct()] : [.. Enum.GetValues<DistractorKind>()];
+
+    /// <summary>Correlated-not-causal decoys hug the onset; the rest follow the configured timing.</summary>
+    private double DecoyOffsetSeconds(DistractorKind kind, TimeSpan incidentDuration)
+    {
+        var seconds = incidentDuration.TotalSeconds;
+        var timing = kind == DistractorKind.CorrelatedNotCausal ? DistractorTiming.Onset : _options.DistractorTiming;
+        var window = timing switch
+        {
+            DistractorTiming.Onset => Math.Min(15, seconds),
+            DistractorTiming.Spread => seconds * 0.9,
+            _ => Math.Min(90, seconds * 0.4),
         };
-        return (IncidentDifficulty)Math.Max((int)inherent, (int)withDistractors);
+        return Rng.Between(0.0, Math.Max(1, window));
+    }
+
+    /// <summary>Emits a decoy, repeated <see cref="LogGeneratorOptions.DistractorIntensity"/> times.</summary>
+    private void EmitDecoy(Distractor decoy, DateTime at)
+    {
+        var repeats = Math.Clamp(_options.DistractorIntensity, 1, 3);
+        for (var i = 0; i < repeats; i++)
+        {
+            decoy.Emit(this, at);
+            at = at.AddSeconds(Rng.Between(15, 45));
+        }
+    }
+
+    /// <summary>
+    /// Negative controls: decoys with no incident at all. The investigator's right answer is "no incident".
+    /// </summary>
+    public DistractorRecord InjectDistractor(DistractorKind kind, DateTime at)
+    {
+        if (!_started) Initialize(at);
+        var decoy = Rng.Pick(Distractor.All.Where(d => d.Kind == kind).ToList());
+        EmitDecoy(decoy, at);
+        return decoy.ToRecord(at);
     }
 
     /// <summary>Ends the active incident at the given time (recovery logs follow on the next Advance).</summary>
@@ -222,28 +311,61 @@ public sealed class LogGenerator
     }
 
     internal void Emit(DateTime timestamp, string level, string service, int eventId, string message,
-        RequestContext? request = null, string? exception = null, int? durationMs = null, string? host = null)
+        RequestContext? request = null, string? exception = null, int? durationMs = null, string? host = null,
+        OperationInfo? operation = null)
     {
+        var resolvedHost = host ?? request?.HostFor(service, Rng) ?? Rng.Pick(Services.HostsFor(service));
+        var truncated = TruncateToMilliseconds(timestamp);
+        var trace = request?.SpanFor(service, Rng);
         var entry = new LogEntry
         {
-            Timestamp = TruncateToMilliseconds(timestamp),
+            Timestamp = truncated,
             Level = level,
             Service = service,
-            Host = host ?? request?.HostFor(service, Rng) ?? Rng.Pick(Services.HostsFor(service)),
+            Host = resolvedHost,
+            Region = Services.Region,
+            AvailabilityZone = Services.ZoneFor(resolvedHost),
+            Version = VersionAt(service, resolvedHost, truncated),
             Environment = _options.Environment,
             EventId = eventId,
             Message = message,
+            TraceId = trace?.TraceId,
+            SpanId = trace?.SpanId,
+            ParentSpanId = trace?.ParentSpanId,
+            UpstreamService = trace?.UpstreamService,
             CorrelationId = request?.CorrelationId,
             RequestId = request?.RequestIdFor(service, Rng),
             SessionId = request?.SessionId,
             UserId = request?.UserId,
             OrderId = request is OrderContext { IsCreated: true } order ? order.OrderId : null,
             DurationMs = durationMs,
+            Operation = operation is null ? null : operation with
+            {
+                StartedAt = TruncateToMilliseconds(operation.StartedAt),
+                TimeoutAt = operation.TimeoutAt is { } timeoutAt ? TruncateToMilliseconds(timeoutAt) : null,
+            },
             Exception = exception,
         };
         _pending.Enqueue(entry, (entry.Timestamp, _sequence++));
         // Compare with the truncated start too: an event logged at the very start instant must count as observed.
-        if (_active is not null && entry.Timestamp >= TruncateToMilliseconds(_active.StartedAt)) _active.Observe(service, eventId);
+        if (_active is not null && entry.Timestamp >= TruncateToMilliseconds(_active.StartedAt)) _active.Observe(entry, request);
+    }
+
+    /// <summary>A deploy: from <paramref name="from"/> on, <paramref name="host"/> runs <paramref name="version"/>.</summary>
+    internal void SetVersion(string host, DateTime from, string version)
+    {
+        if (!_hostVersions.TryGetValue(host, out var history)) _hostVersions[host] = history = [];
+        history.Add((TruncateToMilliseconds(from), version));
+        history.Sort((a, b) => a.From.CompareTo(b.From));
+    }
+
+    private string VersionAt(string service, string host, DateTime at)
+    {
+        var version = Services.InitialVersions[service];
+        if (_hostVersions.TryGetValue(host, out var history))
+            foreach (var (from, v) in history)
+                if (from <= at) version = v;
+        return version;
     }
 
     internal static DateTime TruncateToMilliseconds(DateTime value) =>

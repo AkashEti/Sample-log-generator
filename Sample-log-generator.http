@@ -14,6 +14,12 @@ GET {{host}}/scenarios
 ### Inject an incident right now (durationSeconds is optional)
 POST {{host}}/incidents/AuthenticationFailure?durationSeconds=120&distractors=2
 
+### Inject a specific variant (GET /scenarios lists them)
+POST {{host}}/incidents/PaymentGatewayTimeout?variant=late-authorization&durationSeconds=120
+
+### Inject an incident planned for an evaluation bucket (adversarial: hostile text on top of the outage)
+POST {{host}}/incidents/NetworkTimeout?profile=adversarial&durationSeconds=120
+
 ### Inject a cascading failure (watch it spread over ~2 minutes)
 POST {{host}}/incidents/NotificationBackpressure?durationSeconds=120
 

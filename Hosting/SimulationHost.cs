@@ -83,12 +83,12 @@ public sealed class SimulationHost : IDisposable
     }
 
     /// <exception cref="InvalidOperationException">Another incident is active or the generator is stopped.</exception>
-    public IncidentRecord TriggerIncident(IncidentScenario scenario, TimeSpan? duration, int? distractors)
+    public IncidentRecord TriggerIncident(IncidentScenario scenario, IncidentPlan plan)
     {
         lock (_gate)
         {
             if (!IsRunning) throw new InvalidOperationException("The generator is stopped. POST /generator/start first.");
-            return _generator.StartIncident(scenario, DateTime.UtcNow, duration, distractors);
+            return _generator.StartIncident(scenario, DateTime.UtcNow, plan);
         }
     }
 

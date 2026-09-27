@@ -43,10 +43,23 @@ public sealed class LogGeneratorOptions
     public List<IncidentScenario> EnabledScenarios { get; set; } = [];
 
     /// <summary>
-    /// Unrelated but plausible events (deploys, GC pauses, flag changes...) emitted around each incident.
-    /// 1-2 raise the difficulty to CompetingHypotheses, 3+ to NoisyMisleading.
+    /// Decoy events emitted around each incident (see <see cref="DistractorKind"/>). Benign noise does not change the
+    /// difficulty; correlated/competing decoys raise it to CompetingHypotheses; misleading or security decoys, or 3+
+    /// non-benign decoys, raise it to NoisyMisleading.
     /// </summary>
     public int DistractorsPerIncident { get; set; }
+
+    /// <summary>Kinds to draw decoys from, in rotation. Empty means all five kinds.</summary>
+    public List<DistractorKind> DistractorKinds { get; set; } = [];
+
+    /// <summary>
+    /// When decoys appear within the incident. Correlated-not-causal decoys always appear at the onset,
+    /// because lining up with the incident is what makes them misleading.
+    /// </summary>
+    public DistractorTiming DistractorTiming { get; set; } = DistractorTiming.Early;
+
+    /// <summary>How many times each decoy fires (1-3), 15-45 s apart.</summary>
+    public int DistractorIntensity { get; set; } = 1;
 
     /// <summary>Also inject <see cref="IncidentScenario.PromptInjectionAttempt"/> automatically.</summary>
     public bool IncludePromptInjection { get; set; }
@@ -61,6 +74,19 @@ public sealed class LogGeneratorOptions
     {
         var clone = (LogGeneratorOptions)MemberwiseClone();
         clone.EnabledScenarios = [.. EnabledScenarios];
+        clone.DistractorKinds = [.. DistractorKinds];
         return clone;
     }
+}
+
+public enum DistractorTiming
+{
+    /// <summary>Within the onset (first 15 s).</summary>
+    Onset,
+
+    /// <summary>Within the first 40% of the incident, capped at 90 s: when hypotheses are being formed.</summary>
+    Early,
+
+    /// <summary>Anywhere in the incident.</summary>
+    Spread,
 }

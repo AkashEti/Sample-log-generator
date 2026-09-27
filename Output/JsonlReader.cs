@@ -55,6 +55,19 @@ public static class JsonlReader
         }
     }
 
+    /// <summary>For validation: every line, with a count of the lines that did not parse instead of skipping them silently.</summary>
+    public static (List<T> Items, int BadLines) ReadAllCounted<T>(string path)
+    {
+        var items = new List<T>();
+        var bad = 0;
+        foreach (var line in ReadLines(path))
+        {
+            if (TryDeserialize<T>(line) is { } item) items.Add(item);
+            else bad++;
+        }
+        return (items, bad);
+    }
+
     /// <summary>Returns the most recent <paramref name="take"/> matches, oldest first.</summary>
     private static List<T> Search<T>(string path, int? take, Func<T, bool> matches, Func<string, bool> preFilter)
     {

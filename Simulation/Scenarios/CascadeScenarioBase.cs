@@ -7,16 +7,32 @@ namespace SampleLogGenerator.Simulation.Scenarios;
 /// fractions of its duration. Each stage announces itself with log lines when first reached, keeps emitting
 /// its own symptoms, and changes how requests behave from then on. Requests only see a stage after it has
 /// been announced, so in the logs the cause always appears before its effects.
+/// Every cascade has a full variant and a contained one that stops at <see cref="ContainedAt"/>: the same root cause,
+/// caught before it spreads, so it has fewer hops and a different root-cause statement.
 /// </summary>
 internal abstract class CascadeScenarioBase : IncidentScenarioBase
 {
     private const string StageKey = "stage";
 
-    public override IncidentDifficulty Difficulty => IncidentDifficulty.Distributed;
     public override TimeSpan BackgroundInterval => TimeSpan.FromSeconds(5);
 
+    /// <summary>The last stage of the contained variant.</summary>
+    protected abstract int ContainedAt { get; }
+
+    /// <summary>Shape of the contained variant.</summary>
+    protected virtual IncidentShape ContainedShape => IncidentShape.Correlated;
+
+    /// <summary>Root cause statement of the contained variant.</summary>
+    protected abstract string ContainedRootCause { get; }
+
+    public override IReadOnlyList<ScenarioVariant> Variants =>
+    [
+        new("full-cascade", IncidentShape.Cascade),
+        new($"contained-at-stage-{ContainedAt}", ContainedShape) { MaxStage = ContainedAt, RootCause = ContainedRootCause },
+    ];
+
     // For a cascade, the evidence to find is the propagation path itself.
-    public override IReadOnlyList<EvidenceHint> ExpectedEvidence => CausalChain;
+    public override IReadOnlyList<EvidenceHint> ExpectedEvidence => [.. CausalChain.Select(l => l.ToHint())];
 
     /// <summary>Fraction of the incident at which each stage begins. Index 0 is the root cause and must be 0.</summary>
     protected abstract IReadOnlyList<double> StageStarts { get; }
@@ -32,7 +48,7 @@ internal abstract class CascadeScenarioBase : IncidentScenarioBase
 
     public sealed override void OnBackground(LogGenerator g, ActiveIncident incident, DateTime at)
     {
-        var reached = StageAt(incident.Progress(at));
+        var reached = Math.Min(StageAt(incident.Progress(at)), incident.Variant.MaxStage ?? int.MaxValue);
         for (var stage = Stage(incident) + 1; stage <= reached; stage++)
         {
             incident.State[StageKey] = stage.ToString();

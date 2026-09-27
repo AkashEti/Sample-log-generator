@@ -6,10 +6,11 @@ namespace SampleLogGenerator.Simulation.Scenarios;
 /// Partial, distributed failure. Evidence chain the investigator has to piece together:
 /// <code>
 /// signing key rotation (new kid)
-///   ├─ auth-1: cache refreshed with new kid ──► tokens validate
-///   └─ auth-2/3: cache still holds old kid, last refresh ~45+ min ago ──► IDX10503 ──► 401 ──► checkout failures
+///   ├─ refreshed hosts: cache holds the new kid ──► tokens validate
+///   └─ stale hosts: cache still holds old kid, last refresh ~45+ min ago ──► IDX10503 ──► 401 ──► checkout failures
 /// </code>
-/// No log line states the conclusion ("stale cache"); it has to be inferred from the per-host cache state.
+/// Variants differ in which hosts are stale (one or two of the three). No log line states the conclusion
+/// ("stale cache"); it has to be inferred from the per-host cache state.
 /// </summary>
 internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
 {
@@ -18,28 +19,20 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
     private const string LastRefreshKeyPrefix = "lastRefreshMinutes:";
     private const int CacheStateEveryTicks = 4; // with a 15 s background interval: once a minute
 
+    private static IReadOnlyList<string> AuthHosts => Services.HostsFor(Services.Auth);
+
     public override IncidentScenario Scenario => IncidentScenario.AuthenticationFailure;
     public override string Title => "Checkout authentication failures after key rotation";
-    public override IncidentDifficulty Difficulty => IncidentDifficulty.Distributed;
     public override string RootCauseService => Services.Auth;
-    public override string RootCause =>
-        $"After a signing key rotation, {StaleHosts[0]} and {StaleHosts[1]} kept a stale signing key cache (old kid, not refreshed) and reject tokens " +
-        $"signed with the new key id (IDX10503), so most checkouts fail with 401 Unauthorized; {HealthyHost} refreshed its cache and keeps working.";
     public override IReadOnlyList<string> AffectedServices => [Services.Auth, Services.Order];
-    public override IReadOnlyList<EvidenceHint> ExpectedEvidence =>
-    [
-        new(Services.Auth, EventIds.SigningKeyRotated, "Signing key rotation introduces a new kid right before failures start"),
-        new(Services.Auth, EventIds.SigningKeyCacheState, "Only the failing hosts still cache the previous kid and have not refreshed for 45+ minutes"),
-        new(Services.Auth, EventIds.TokenValidationFailed, "IDX10503 for the new kid, only on the stale AuthService hosts"),
-        new(Services.Order, EventIds.CheckoutUnauthorized, "Checkout requests rejected with 401"),
-    ];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
-    [
-        new(Services.Auth, EventIds.SigningKeyRotated, "Signing key rotated (new kid)"),
-        new(Services.Auth, EventIds.SigningKeyCacheState, "Two instances keep the old kid in their cache"),
-        new(Services.Auth, EventIds.TokenValidationFailed, "IDX10503 on those instances"),
-        new(Services.Order, EventIds.CheckoutUnauthorized, "Checkouts rejected with 401"),
-    ];
+
+    // The defaults describe the classic form: the first host refreshed, the other two are stale.
+    private static readonly ScenarioVariant Classic = StaleCache([.. AuthHosts.Skip(1)]);
+    public override string RootCause => Classic.RootCause!;
+    public override IReadOnlyList<EvidenceHint> ExpectedEvidence => Classic.ExpectedEvidence!;
+    public override IReadOnlyList<CausalLink> CausalChain => Classic.CausalChain!;
+    public override IReadOnlyList<AbsenceCondition> ExpectedAbsences => Classic.ExpectedAbsences!;
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence => Classic.RecoveryEvidence!;
     public override IReadOnlyList<string> Remediation =>
     [
         "Force a signing key (JWKS) cache refresh on the stale AuthService instances",
@@ -47,11 +40,52 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
         "Alert on authentication failure rate and key cache age per instance",
     ];
 
-    private static IReadOnlyList<string> AuthHosts => Services.HostsFor(Services.Auth);
+    /// <summary>Two stale hosts (each host once the healthy one), or a single stale host.</summary>
+    public override IReadOnlyList<ScenarioVariant> Variants =>
+    [
+        Classic,
+        .. AuthHosts.Skip(1).Select(healthy => StaleCache([.. AuthHosts.Where(h => h != healthy)])),
+        .. AuthHosts.Select(stale => StaleCache([stale])),
+    ];
 
-    // The first host was refreshed by the rotation job; the others hold a stale cache.
-    private static string HealthyHost => AuthHosts[0];
-    private static IReadOnlyList<string> StaleHosts => [.. AuthHosts.Skip(1)];
+    private static ScenarioVariant StaleCache(IReadOnlyList<string> stale)
+    {
+        var healthy = AuthHosts.Where(h => !stale.Contains(h)).ToList();
+        string Join(IEnumerable<string> hosts) => string.Join(" and ", hosts);
+        return new ScenarioVariant($"stale-cache:{string.Join(",", stale)}", IncidentShape.Correlated)
+        {
+            Hosts = stale,
+            RootCause =
+                $"After a signing key rotation, {Join(stale)} kept a stale signing key cache (old kid, not refreshed) and reject tokens signed with " +
+                $"the new key id (IDX10503), so checkouts routed to {(stale.Count == 1 ? "it" : "them")} fail with 401 Unauthorized; " +
+                $"{Join(healthy)} refreshed {(healthy.Count == 1 ? "its" : "their")} cache and keep{(healthy.Count == 1 ? "s" : "")} working.",
+            ExpectedEvidence =
+            [
+                new(Services.Auth, EventIds.SigningKeyRotated, "Signing key rotation introduces a new kid right before failures start"),
+                new(Services.Auth, EventIds.SigningKeyCacheState, "Only the failing hosts still cache the previous kid and have not refreshed for 45+ minutes"),
+                new(Services.Auth, EventIds.TokenValidationFailed, "IDX10503 for the new kid, only on the stale AuthService hosts", stale),
+                new(Services.Order, EventIds.CheckoutUnauthorized, "Checkout requests rejected with 401"),
+            ],
+            CausalChain =
+            [
+                new(Services.Auth, EventIds.SigningKeyRotated, "Signing key rotated (new kid)"),
+                new(Services.Auth, EventIds.SigningKeyCacheState, $"{stale.Count} instance{(stale.Count == 1 ? "" : "s")} keep the old kid in the cache"),
+                new(Services.Auth, EventIds.TokenValidationFailed, "IDX10503 on those instances"),
+                new(Services.Order, EventIds.CheckoutUnauthorized, "Checkouts rejected with 401"),
+            ],
+            ExpectedAbsences =
+            [
+                new(AbsenceKind.NoEventOnHosts, Services.Auth, "Instances that refreshed their key cache never reject a token", EventIds.TokenValidationFailed, healthy),
+            ],
+            RecoveryEvidence =
+            [
+                new(Services.Auth, EventIds.SigningKeyCacheRefreshed, "Stale instances refresh their key cache", stale),
+            ],
+        };
+    }
+
+    private static IReadOnlyList<string> StaleHosts(ActiveIncident incident) => incident.Variant.Hosts;
+    private static IReadOnlyList<string> HealthyHosts(ActiveIncident incident) => [.. AuthHosts.Where(h => !incident.Variant.Hosts.Contains(h))];
 
     // During the incident, a generic "keys refreshed" message on a random host would contradict the evidence.
     public override bool SuppressesNoise(int eventId) => eventId == EventIds.JwksRefreshed;
@@ -61,13 +95,16 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
         var kid = "key-" + g.Rng.Hex(8);
         incident.State[KeyIdKey] = kid;
         incident.State[PreviousKeyIdKey] = "key-" + g.Rng.Hex(8);
-        foreach (var host in StaleHosts)
+        foreach (var host in StaleHosts(incident))
             incident.State[LastRefreshKeyPrefix + host] = g.Rng.Between(44, 52).ToString();
 
+        // The rotation job runs on one refreshed instance; each refreshed instance reloads its cache right away.
+        var rotator = HealthyHosts(incident)[0];
         g.Emit(at, Levels.Information, Services.Auth, EventIds.SigningKeyRotated,
-            $"Signing key rotation completed: new key id {kid}, previous key id {incident.State[PreviousKeyIdKey]}", host: HealthyHost);
-        g.Emit(at.AddMilliseconds(g.Rng.Between(200, 800)), Levels.Information, Services.Auth, EventIds.SigningKeyCacheRefreshed,
-            $"Signing key cache refreshed with kid {kid}", host: HealthyHost);
+            $"Signing key rotation completed: new key id {kid}, previous key id {incident.State[PreviousKeyIdKey]}", host: rotator);
+        foreach (var host in HealthyHosts(incident))
+            g.Emit(at.AddMilliseconds(g.Rng.Between(200, 800)), Levels.Information, Services.Auth, EventIds.SigningKeyCacheRefreshed,
+                $"Signing key cache refreshed with kid {kid}", host: host);
 
         // The rotation triggers a cache status report on every instance, logged before any request can fail.
         EmitCacheState(g, incident, at, jitter: false);
@@ -75,7 +112,7 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
 
     public override void OnBackground(LogGenerator g, ActiveIncident incident, DateTime at)
     {
-        foreach (var host in StaleHosts)
+        foreach (var host in StaleHosts(incident))
         {
             g.Emit(at.AddMilliseconds(g.Rng.Between(0, 2000)), Levels.Warning, Services.Auth, EventIds.AuthFailureRateHigh,
                 $"Elevated token validation failure rate on this instance: {g.Rng.Between(94, 100)}% of validations failed in the last minute", host: host);
@@ -91,7 +128,7 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
         var elapsedMinutes = (int)(at - incident.StartedAt).TotalMinutes;
         foreach (var host in AuthHosts)
         {
-            var (cachedKid, lastRefresh) = host == HealthyHost
+            var (cachedKid, lastRefresh) = !StaleHosts(incident).Contains(host)
                 ? (incident.State[KeyIdKey], elapsedMinutes)
                 : (incident.State[PreviousKeyIdKey], int.Parse(incident.State[LastRefreshKeyPrefix + host]) + elapsedMinutes);
 
@@ -105,7 +142,7 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
         var o = f.Order;
         var host = f.Rng.Pick(AuthHosts);
         o.PinHost(Services.Auth, host);
-        if (host == HealthyHost)
+        if (!StaleHosts(incident).Contains(host))
         {
             CommonFlows.Normal(f);
             return;
@@ -124,7 +161,7 @@ internal sealed class AuthenticationFailureScenario : IncidentScenarioBase
 
     public override void OnEnd(LogGenerator g, ActiveIncident incident, DateTime at)
     {
-        foreach (var host in StaleHosts)
+        foreach (var host in StaleHosts(incident))
         {
             g.Emit(at, Levels.Information, Services.Auth, EventIds.SigningKeyCacheRefreshed,
                 $"Signing key cache refreshed with kid {incident.State[KeyIdKey]}", host: host);

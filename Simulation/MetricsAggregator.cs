@@ -61,7 +61,11 @@ internal sealed class MetricsAggregator(string environment)
         if (entry.DurationMs is { } ms) window.Durations.Add(ms);
     }
 
-    public IEnumerable<MetricSample> Snapshot(DateTime at, ActiveIncident? incident, Random rng)
+    /// <summary>
+    /// Counters and window aggregates cover the <paramref name="windowSeconds"/> ending at <paramref name="at"/>;
+    /// gauges are readings at <paramref name="at"/>.
+    /// </summary>
+    public IEnumerable<MetricSample> Snapshot(DateTime at, int windowSeconds, ActiveIncident? incident, Random rng)
     {
         var samples = new List<MetricSample>();
         var active = incident is not null && incident.IsActiveAt(at) ? incident : null;
@@ -71,22 +75,23 @@ internal sealed class MetricsAggregator(string environment)
             var w = _windows[service];
             double Value(string metric, double baseline) =>
                 active?.Scenario.Gauge(service, metric, active, at, rng) ?? baseline;
-            void Add(string metric, double value, string unit) => samples.Add(new MetricSample
+            void Add(string metric, double value, string unit, string type) => samples.Add(new MetricSample
             {
-                Timestamp = at, Service = service, Metric = metric, Value = Math.Round(value, 2), Unit = unit, Environment = environment,
+                Timestamp = at, Service = service, Metric = metric, Value = Math.Round(value, 2), Unit = unit, Type = type,
+                WindowSeconds = type == MetricTypes.Gauge ? null : windowSeconds, Environment = environment,
             });
 
-            Add("event_count", w.Events, "count");
-            Add("error_count", w.Errors, "count");
-            Add("error_rate_percent", w.Events == 0 ? 0 : 100.0 * w.Errors / w.Events, "percent");
-            if (w.Durations.Count > 0) Add("latency_p95_ms", Percentile95(w.Durations), "ms");
-            Add("cpu_percent", Value("cpu_percent", rng.Between(12.0, 38.0)), "percent");
+            Add("event_count", w.Events, "count", MetricTypes.Counter);
+            Add("error_count", w.Errors, "count", MetricTypes.Counter);
+            Add("error_rate_percent", w.Events == 0 ? 0 : 100.0 * w.Errors / w.Events, "percent", MetricTypes.WindowAggregate);
+            if (w.Durations.Count > 0) Add("latency_p95_ms", Percentile95(w.Durations), "ms", MetricTypes.WindowAggregate);
+            Add("cpu_percent", Value("cpu_percent", rng.Between(12.0, 38.0)), "percent", MetricTypes.Gauge);
             var (memMin, memMax) = MemoryBaseline[service];
-            Add("memory_mb", Value("memory_mb", rng.Between(memMin, memMax)), "MB");
+            Add("memory_mb", Value("memory_mb", rng.Between(memMin, memMax)), "MB", MetricTypes.Gauge);
 
             if (ServiceGauges.TryGetValue(service, out var gauges))
                 foreach (var (metric, unit, min, max) in gauges)
-                    Add(metric, Value(metric, Math.Round(rng.Between(min, max))), unit);
+                    Add(metric, Value(metric, Math.Round(rng.Between(min, max))), unit, MetricTypes.Gauge);
 
             w.Events = 0;
             w.Errors = 0;

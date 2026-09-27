@@ -29,23 +29,33 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
         $"including ones that never reached the gateway, and OrderService's {OrderTimeoutMs / 1000} s calls to PaymentService timed out, so orders failed.";
     public override IReadOnlyList<string> AffectedServices => [Services.Payment, Services.Order, Services.Inventory];
     protected override IReadOnlyList<double> StageStarts => [0, 0.2, 0.45];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    protected override int ContainedAt => 1;
+    protected override string ContainedRootCause =>
+        $"The external payment gateway ({Gateway}) slowed down and PaymentService held a payments-db connection for the whole gateway call " +
+        $"({HoldingCaller}), so pool usage climbed but the pool never ran out. Payments slower than OrderService's {OrderTimeoutMs / 1000} s timeout " +
+        "failed their orders, and some of those payments were still authorized afterwards.";
+    public override IReadOnlyList<CausalLink> CausalChain =>
     [
         new(Services.Payment, EventIds.GatewayLatencyHigh, "Gateway p95 latency rises first; there is no deploy or other change before it"),
         new(Services.Payment, EventIds.ConnectionHeldTooLong, $"Connections held only as long as a gateway call takes (opened by {HoldingCaller})"),
         new(Services.Payment, EventIds.ConnectionPoolUsageHigh, "Pool usage climbs on every instance"),
-        new(Services.Order, EventIds.PaymentCallTimeout, "OrderService's calls to PaymentService time out (no socket error: requests did reach PaymentService)"),
-        new(Services.Order, EventIds.OrderPaymentFailed, "Orders marked PaymentFailed"),
+        new(Services.Order, EventIds.PaymentCallTimeout, "OrderService's calls to PaymentService time out (no socket error: requests did reach PaymentService)", Concurrent: true),
+        new(Services.Order, EventIds.OrderPaymentFailed, "Orders marked PaymentFailed", Concurrent: true),
         new(Services.Payment, EventIds.ConnectionPoolExhausted, "Pool exhausted"),
         new(Services.Payment, EventIds.PaymentPersistFailed, "Every payment now fails waiting for a pool connection"),
     ];
     // A side effect whose timing varies, so it is expected evidence but not a link in the ordered chain.
     public override IReadOnlyList<EvidenceHint> ExpectedEvidence =>
     [
-        .. CausalChain,
+        .. CausalChain.Select(l => l.ToHint()),
         new(Services.Order, EventIds.LatePaymentForFailedOrder, "Payments authorized after OrderService already failed the order"),
     ];
 
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence =>
+    [
+        new(Services.Payment, EventIds.GatewayLatencyRecovered, "Gateway latency back to normal"),
+        new(Services.Payment, EventIds.ConnectionPoolRecovered, "Connection pool usage back to normal"),
+    ];
     public override IReadOnlyList<string> Remediation =>
     [
         "Do not hold a DB connection or transaction across the external gateway call",
@@ -145,8 +155,9 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
 
                 // OrderService gives up at 10 s while PaymentService keeps waiting on the gateway.
                 incident.MarkAffected(o);
+                var callerTimeoutAt = paymentStart.AddMilliseconds(OrderTimeoutMs);
                 f.Wait(OrderTimeoutMs).Error(Services.Order, EventIds.PaymentCallTimeout, $"HTTP request to PaymentService timed out for order {o.OrderId}",
-                        Exceptions.HttpClientTimeout("PaymentClient", "ChargeAsync", OrderTimeoutMs / 1000), OrderTimeoutMs)
+                        Exceptions.HttpClientTimeout("PaymentClient", "ChargeAsync", OrderTimeoutMs / 1000), OrderTimeoutMs, f.TimedOut("PaymentClient.Charge", paymentStart, 1))
                  .Wait(5, 30).Error(Services.Order, EventIds.OrderPaymentFailed, $"Order {o.OrderId} marked as PaymentFailed");
                 CommonFlows.ReleaseInventory(f);
                 var orderFailedAt = f.Cursor;
@@ -154,12 +165,13 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
                 f.At(paymentStart);
                 if (latency >= 28000)
                 {
-                    f.Wait(30000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", Exceptions.GatewayTimeout, 30000)
+                    f.Wait(30000).Error(Services.Payment, EventIds.GatewayTimeout, $"Payment gateway request timed out for order {o.OrderId}", Exceptions.GatewayTimeout, 30000,
+                        Flow.Late("PaymentClient.Charge", paymentStart, callerTimeoutAt, success: false, 1))
                      .Wait(5, 20).Error(Services.Payment, EventIds.PaymentFailed, $"Payment failed for order {o.OrderId}: gateway timeout");
                 }
                 else
                 {
-                    Authorize(f, latency);
+                    Authorize(f, latency, Flow.Late("PaymentClient.Charge", paymentStart, callerTimeoutAt, success: true, 1));
                     if (f.Cursor < orderFailedAt) f.At(orderFailedAt);
                     f.Wait(20, 200).Warning(Services.Order, EventIds.LatePaymentForFailedOrder,
                         $"Payment authorization for order {o.OrderId} arrived after the order was marked PaymentFailed; refund required");
@@ -181,11 +193,13 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
                 {
                     var attemptStart = f.Cursor;
                     f.Wait(OrderTimeoutMs).Error(Services.Order, EventIds.PaymentCallTimeout, $"HTTP request to PaymentService timed out for order {o.OrderId}",
-                        Exceptions.HttpClientTimeout("PaymentClient", "ChargeAsync", OrderTimeoutMs / 1000), OrderTimeoutMs);
+                        Exceptions.HttpClientTimeout("PaymentClient", "ChargeAsync", OrderTimeoutMs / 1000), OrderTimeoutMs,
+                        f.TimedOut("PaymentClient.Charge", attemptStart, attempt));
                     var orderSideAt = f.Cursor;
 
                     f.At(attemptStart).Wait(15000)
-                     .Error(Services.Payment, EventIds.PaymentPersistFailed, $"Failed to persist payment transaction for order {o.OrderId}", Exceptions.PoolTimeout, 15000);
+                     .Error(Services.Payment, EventIds.PaymentPersistFailed, $"Failed to persist payment transaction for order {o.OrderId}", Exceptions.PoolTimeout, 15000,
+                        Flow.Late("PaymentClient.Charge", attemptStart, orderSideAt, success: false, attempt));
 
                     f.At(orderSideAt);
                     if (attempt == 1)
@@ -202,7 +216,7 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
         }
     }
 
-    private static void Authorize(Flow f, int latencyMs)
+    private static void Authorize(Flow f, int latencyMs, OperationInfo? operation = null)
     {
         var o = f.Order;
         if (latencyMs > 5000)
@@ -210,7 +224,7 @@ internal sealed class GatewaySlowdownCascadeScenario : CascadeScenarioBase
              .Wait(latencyMs - 5000);
         else
             f.Wait(latencyMs);
-        f.Info(Services.Payment, EventIds.PaymentAuthorized, $"Payment authorized for order {o.OrderId} (transaction txn_{f.Rng.Hex(10)})", latencyMs);
+        f.Info(Services.Payment, EventIds.PaymentAuthorized, $"Payment authorized for order {o.OrderId} (transaction txn_{f.Rng.Hex(10)})", latencyMs, operation);
     }
 
     public override void OnEnd(LogGenerator g, ActiveIncident incident, DateTime at)

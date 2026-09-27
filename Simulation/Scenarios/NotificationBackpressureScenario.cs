@@ -34,7 +34,13 @@ internal sealed class NotificationBackpressureScenario : CascadeScenarioBase
         "publish OrderConfirmed and paid orders were left in PaymentCaptured.";
     public override IReadOnlyList<string> AffectedServices => [Services.Notification, Services.Order];
     protected override IReadOnlyList<double> StageStarts => [0, 0.2, 0.4, 0.55];
-    public override IReadOnlyList<EvidenceHint> CausalChain =>
+    protected override int ContainedAt => 1;
+    protected override IncidentShape ContainedShape => IncidentShape.Direct;
+    protected override string ContainedRootCause =>
+        $"The SMTP relay ({SmtpRelay}) used by NotificationService started timing out. Email workers blocked on 30 s sends, so confirmation " +
+        "emails failed or waited in the queue. The relay recovered before the backlog was large enough to throttle the message broker, " +
+        "so orders themselves were not affected.";
+    public override IReadOnlyList<CausalLink> CausalChain =>
     [
         new(Services.Notification, EventIds.SmtpTimeout, "SMTP sends to the relay time out after 30 s"),
         new(Services.Notification, EventIds.WorkersSaturated, "Every email worker is blocked; prefetch limit reached"),
@@ -42,6 +48,11 @@ internal sealed class NotificationBackpressureScenario : CascadeScenarioBase
         new(Services.Order, EventIds.BrokerFlowControl, "Broker blocks publishers (memory alarm)"),
         new(Services.Order, EventIds.EventPublishTimeout, "OrderService times out publishing OrderConfirmed"),
         new(Services.Order, EventIds.OrderAwaitingConfirmation, "Paid orders stuck in PaymentCaptured"),
+    ];
+    public override IReadOnlyList<EvidenceHint> RecoveryEvidence =>
+    [
+        new(Services.Notification, EventIds.SmtpRecovered, "SMTP relay responding again; backlog draining"),
+        new(Services.Order, EventIds.BrokerFlowControlLifted, "Broker flow control lifted"),
     ];
     public override IReadOnlyList<string> Remediation =>
     [
@@ -101,7 +112,9 @@ internal sealed class NotificationBackpressureScenario : CascadeScenarioBase
         if (stage >= 3 && f.Rng.Chance(0.85))
         {
             incident.MarkAffected(o);
-            f.Wait(5000).Error(Services.Order, EventIds.EventPublishTimeout, $"Timed out publishing OrderConfirmed for order {o.OrderId} after 5000 ms", PublishTimeout, 5000)
+            var publishStart = f.Cursor;
+            f.Wait(5000).Error(Services.Order, EventIds.EventPublishTimeout, $"Timed out publishing OrderConfirmed for order {o.OrderId} after 5000 ms", PublishTimeout, 5000,
+                f.TimedOut("EventPublisher.Publish", publishStart))
              .Wait(5, 20).Warning(Services.Order, EventIds.OrderAwaitingConfirmation,
                 $"Order {o.OrderId} left in state PaymentCaptured; OrderConfirmed queued in outbox for retry");
             return;
@@ -116,6 +129,7 @@ internal sealed class NotificationBackpressureScenario : CascadeScenarioBase
         f.Wait(10, 60).Info(Services.Notification, EventIds.EmailQueued, $"Order confirmation email queued for order {o.OrderId}");
         if (f.Rng.Chance(0.5))
         {
+            incident.MarkAffected(o); // the customer gets no confirmation email
             f.Wait(30000).Warning(Services.Notification, EventIds.EmailSendFailed,
                 $"Confirmation email for order {o.OrderId} not sent: SMTP timeout after 30000 ms; will retry", SmtpTimeout, 30000);
         }

@@ -8,12 +8,13 @@ using SampleLogGenerator.Output;
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
-var builder = WebApplication.CreateBuilder(args is ["dataset", ..] ? [] : args);
+var offline = args.Length > 0 && DatasetCli.Commands.Contains(args[0]);
+var builder = WebApplication.CreateBuilder(offline ? [] : args);
 var generatorSection = builder.Configuration.GetSection(LogGeneratorOptions.SectionName);
 
-// Offline mode: dotnet run -- dataset --minutes 60 --incidents 5 --seed 42
-if (args is ["dataset", .. var datasetArgs])
-    return DatasetCli.Run(datasetArgs, generatorSection.Get<LogGeneratorOptions>() ?? new LogGeneratorOptions());
+// Offline commands: dataset / validate / benchmark (see DatasetCli)
+if (offline)
+    return DatasetCli.Run(args[0], args[1..], generatorSection.Get<LogGeneratorOptions>() ?? new LogGeneratorOptions());
 
 builder.Services.AddOpenApi();
 builder.Services.Configure<LogGeneratorOptions>(generatorSection);
